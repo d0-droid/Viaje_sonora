@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Matriz/Grafo — Distancia carretera + recta (Leaflet + OSRM)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  :root{--muted:#6b7280}
+  body{font-family:Inter,system-ui,Arial;margin:12px;background:#f5f7fb;color:#111}
+  .panel{background:#fff;padding:12px;border-radius:10px;box-shadow:0 6px 18px rgba(10,20,40,.06);margin-bottom:12px}
+  h1{margin:0 0 8px;font-size:18px}
+  textarea,input,button,select{font-size:13px}
+  textarea{width:100%;min-height:80px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .small{padding:6px 8px;font-size:13px}
+  table{border-collapse:collapse;width:100%}
+  table td,table th{border:1px solid #e6edf3;padding:6px;text-align:center;vertical-align:middle}
+  #map{height:520px;border-radius:8px;border:1px solid #e6edf3}
+  .muted{color:var(--muted)}
+  .progress{font-size:13px;color:#065f46}
+  .error{color:#b91c1c}
+  .edge-label { background:white;padding:2px 6px;border-radius:4px;border:1px solid rgba(0,0,0,.12); font-size:12px; }
+  .cell-road{font-weight:700}
+  .cell-straight{font-size:12px;color:#374151}
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <h1>Matriz & Grafo — Distancia por carretera + recta</h1>
+  <p class="muted">Lista por defecto de pueblos. Pulsa <b>Generar matriz</b> → <b>Calcular distancias (OSRM)</b> para llenar la matriz completa. Usa <b>Aplicar umbral</b> para mostrar solo aristas cortas.</p>
+
+  <textarea id="rawInput"></textarea>
+
+  <div class="controls">
+    <button id="genBtn" class="small">Generar matriz</button>
+    <button id="calcDistancesBtn" class="small">Calcular distancias (OSRM table → fallback)</button>
+    <label class="small">Delay por par (ms): <input id="delayMs" value="800" style="width:90px"/></label>
+    <label class="small">Umbral aristas ≤ <input id="edgeThresh" type="number" value="500" style="width:80px"/> km</label>
+    <button id="applyThreshBtn" class="small">Aplicar umbral</button>
+    <button id="exportCsvBtn" class="small">Exportar matriz (CSV)</button>
+    <button id="fitMapBtn" class="small">Ajustar mapa</button>
+  </div>
+
+  <div style="margin-top:8px">
+    <span id="status" class="progress">Estado: esperando</span>
+    <span id="err" class="error" style="margin-left:12px"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <h3>Matriz editable (cada celda = carretera / (recta))</h3>
+  <div id="matrixWrap" style="overflow:auto;max-height:320px"></div>
+</div>
+
+<div class="panel">
+  <h3>Mapa + Grafo</h3>
+  <div id="map"></div>
+
+  <div style="margin-top:8px" class="controls">
+    <label class="small">Ruta a evaluar (coma): <input id="routeInput" placeholder="Aconchi,Huépac,..." style="width:360px"/></label>
+    <button id="calcRouteBtn" class="small">Calcular costo & combustible</button>
+    <button id="dijkstraBtn" class="small">Dijkstra (ruta óptima)</button>
+  </div>
+  <div id="results" style="margin-top:8px"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ============================
+   DATOS: pueblos y coords
+   ============================ */
+const DEFAULT_TOWNS = [
+  "Aconchi","Huépac","Cumpas","Baviácora","Ures","Rayón","San Felipe de Jesús",
+  "Altar","Atil","Caborca","Puerto Peñasco","Oquitoa","Pitiquito","Sáric",
+  "Trincheras","Tubutama","San Luis Río Colorado","Bacadéhuachi","Huachinera",
+  "Nácori Chico","Sahuaripa","Divisaderos","Granados","Huásabas","Villa Hidalgo"
+];
+
+// Coordenadas aproximadas (lat, lon)
+const COORDS = {
+  "Aconchi":[29.8333,-110.2167],"Huépac":[29.9,-110.1667],"Cumpas":[30.0167,-109.7833],
+  "Baviácora":[29.7333,-110.1667],"Ures":[29.4333,-110.4],"Rayón":[29.7167,-110.5833],
+  "San Felipe de Jesús":[29.6833,-110.35],"Altar":[30.7,-111.8333],"Atil":[30.85,-111.5667],
+  "Caborca":[30.7167,-112.15],"Puerto Peñasco":[31.3167,-113.5333],"Oquitoa":[30.7333,-111.8833],
+  "Pitiquito":[30.7167,-112.0667],"Sáric":[31.0667,-111.3333],"Trincheras":[30.4,-111.5333],
+  "Tubutama":[30.8667,-111.3333],"San Luis Río Colorado":[32.4560,-114.7710],"Bacadéhuachi":[29.65,-109.2167],
+  "Huachinera":[29.7333,-108.95],"Nácori Chico":[29.5833,-108.8333],"Sahuaripa":[29.05,-109.2333],
+  "Divisaderos":[29.65,-109.4833],"Granados":[29.8833,-109.3333],"Huásabas":[29.7667,-109.5167],
+  "Villa Hidalgo":[29.55,-110.5833]
+};
+
+/* ============================
+   Estado app
+   ============================ */
+let towns = [];
+let matrixRoad = [];      // km (number or null)
+let matrixStraight = [];  // km (number)
+let map = null;
+let markers = [];
+let edgeLayer = null;
+let edgeLabelMarkers = [];
+let highlightedLayer = null;
+let currentEdgeThreshold = null;
+
+/* ============================
+   Utilidades
+   ============================ */
+function setStatus(s){ document.getElementById('status').textContent = 'Estado: ' + s; }
+function setError(e){ document.getElementById('err').textContent = e || ''; }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function escapeCsv(s){ if(s==null) return ''; return '"' + String(s).replace(/"/g,'""') + '"'; }
+
+/* Haversine (km) */
+function haversineKm(aLat,aLon,bLat,bLon){
+  const R = 6371;
+  const dLat = (bLat-aLat)*Math.PI/180;
+  const dLon = (bLon-aLon)*Math.PI/180;
+  const A = Math.sin(dLat/2)**2 + Math.cos(aLat*Math.PI/180)*Math.cos(bLat*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(A), Math.sqrt(1-A));
+}
+
+/* ============================
+   UI: generar matriz y render
+   ============================ */
+document.getElementById('rawInput').value = DEFAULT_TOWNS.join('\n');
+
+document.getElementById('genBtn').addEventListener('click', ()=>{
+  const raw = document.getElementById('rawInput').value.trim();
+  if(!raw){ setError('Pega lista de pueblos'); return; }
+  towns = raw.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const n = towns.length;
+  matrixRoad = Array.from({length:n}, ()=>Array.from({length:n}, ()=>null));
+  matrixStraight = Array.from({length:n}, ()=>Array.from({length:n}, ()=>null));
+  for(let i=0;i<n;i++){ matrixRoad[i][i]=0; matrixStraight[i][i]=0; }
+  computeStraightMatrix();
+  renderMatrix();
+  renderMap();
+  drawGraph();
+  setStatus('Matriz creada con ' + n + ' pueblos (dist. recta precalculada)');
+});
+
+/* render matrix: each cell two lines */
+function renderMatrix(){
+  const wrap = document.getElementById('matrixWrap'); wrap.innerHTML = '';
+  if(!towns.length) return;
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headrow = document.createElement('tr');
+  headrow.appendChild(document.createElement('th'));
+  towns.forEach(t=>{ const th=document.createElement('th'); th.textContent=t; headrow.appendChild(th); });
+  thead.appendChild(headrow); table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for(let i=0;i<towns.length;i++){
+    const tr = document.createElement('tr');
+    const label = document.createElement('th'); label.textContent=towns[i]; tr.appendChild(label);
+    for(let j=0;j<towns.length;j++){
+      const td = document.createElement('td');
+      if(i===j){ td.textContent='0'; }
+      else{
+        const road = matrixRoad[i][j];
+        const straight = matrixStraight[i][j];
+        // cell with two lines
+        const div = document.createElement('div');
+        div.style.lineHeight = '1.0';
+        const top = document.createElement('div'); top.className='cell-road';
+        top.textContent = (road===null||road===undefined||road==='')? '' : `${road} km`;
+        const bottom = document.createElement('div'); bottom.className='cell-straight';
+        bottom.textContent = straight? `(${straight} km)` : '';
+        div.appendChild(top); div.appendChild(bottom);
+        td.appendChild(div);
+        // make input editable: when click convert to input for road value only (optional)
+        td.addEventListener('dblclick', ()=>{
+          const inp = document.createElement('input');
+          inp.type='number'; inp.style.width='80px';
+          inp.value = (road===null||road===undefined)?'':road;
+          inp.addEventListener('change', ()=>{ 
+            const v = inp.value===''? null : Number(inp.value); 
+            matrixRoad[i][j] = v; matrixRoad[j][i] = v;
+            renderMatrix(); drawGraph();
+          });
+          td.innerHTML=''; td.appendChild(inp); inp.focus();
+        });
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody); wrap.appendChild(table);
+}
+
+/* ============================
+   Straight distances matrix
+   ============================ */
+function computeStraightMatrix(){
+  const n = towns.length;
+  for(let i=0;i<n;i++){
+    for(let j=0;j<n;j++){
+      if(i===j){ matrixStraight[i][j]=0; continue; }
+      const a = towns[i], b = towns[j];
+      const ca = COORDS[a], cb = COORDS[b];
+      if(!ca || !cb){ matrixStraight[i][j] = null; continue; }
+      const km = Math.round(haversineKm(ca[0],ca[1],cb[0],cb[1]));
+      matrixStraight[i][j] = km;
+    }
+  }
+}
+
+/* ============================
+   Leaflet map + markers
+   ============================ */
+function ensureMap(){
+  if(map) return;
+  map = L.map('map').setView([30.3,-111.6],7);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18, attribution:'© OpenStreetMap contributors'}).addTo(map);
+}
+
+function renderMap(){
+  ensureMap();
+  // clear markers & layers
+  markers.forEach(m=>map.removeLayer(m)); markers = [];
+  if(edgeLayer){ map.removeLayer(edgeLayer); edgeLayer = null; }
+  edgeLabelMarkers.forEach(m=>map.removeLayer(m)); edgeLabelMarkers = [];
+  if(highlightedLayer){ map.removeLayer(highlightedLayer); highlightedLayer = null; }
+  for(let i=0;i<towns.length;i++){
+    const t = towns[i];
+    const c = COORDS[t];
+    if(!c) continue;
+    const m = L.marker(c).addTo(map).bindPopup(`<b>${t}</b><br>index ${i}`);
+    markers.push(m);
+  }
+  fitMap();
+}
+
+/* fit bounds */
+function fitMap(){
+  if(markers.length===0) return;
+  const g = L.featureGroup(markers);
+  map.fitBounds(g.getBounds().pad(0.2));
+}
+
+/* ============================
+   Draw graph edges and labels
+   ============================ */
+function drawGraph(){
+  ensureMap();
+  // remove previous
+  if(edgeLayer) { map.removeLayer(edgeLayer); edgeLayer = null; }
+  edgeLayer = L.layerGroup().addTo(map);
+  edgeLabelMarkers.forEach(m=>map.removeLayer(m)); edgeLabelMarkers = [];
+  const n = towns.length;
+  for(let i=0;i<n;i++){
+    for(let j=i+1;j<n;j++){
+      const road = matrixRoad[i][j];
+      const straight = matrixStraight[i][j];
+      if(road===null||road===undefined) continue; // don't draw edges without road distance
+      if(currentEdgeThreshold!=null && road > currentEdgeThreshold) continue;
+      const ci = COORDS[towns[i]], cj = COORDS[towns[j]];
+      if(!ci || !cj) continue;
+      const poly = L.polyline([ci,cj], {color:'#2563eb', weight:2, opacity:0.8}).addTo(edgeLayer);
+      poly.bindPopup(`${towns[i]} → ${towns[j]}<br>Carretera: ${road} km<br>Recta: ${straight} km`);
+      // create label marker at midpoint
+      const mid = [(ci[0]+cj[0])/2, (ci[1]+cj[1])/2];
+      const label = L.marker(mid, {
+        icon: L.divIcon({
+          className: 'edge-label',
+          html: `<div style="text-align:center">${road} km</div>`
+        }),
+        interactive: false
+      }).addTo(map);
+      edgeLabelMarkers.push(label);
+    }
+  }
+}
+
+/* ============================
+   OSRM: table then fallback per-pair
+   ============================ */
+document.getElementById('calcDistancesBtn').addEventListener('click', async ()=>{
+  setError(''); if(!towns.length){ setError('Genera la matriz primero'); return; }
+  setStatus('Preparando coordenadas...');
+  const locs = [];
+  for(const t of towns){
+    const c = COORDS[t];
+    if(!c){ setError('Falta coordenada para: ' + t); return; }
+    locs.push(c);
+  }
+  // osrm table expects lon,lat
+  const coordStr = locs.map(c => `${c[1]},${c[0]}`).join(';');
+  const tableUrl = `https://router.project-osrm.org/table/v1/driving/${coordStr}?annotations=distance`;
+  setStatus('Intentando OSRM /table (una petición)...');
+  try{
+    const res = await fetch(tableUrl);
+    if(!res.ok) throw new Error('Table request failed: ' + res.status);
+    const json = await res.json();
+    if(json && json.distances){
+      setStatus('OSRM/table devolvió distancias — rellenando matrizRoad');
+      const dist = json.distances;
+      for(let i=0;i<dist.length;i++){
+        for(let j=0;j<dist.length;j++){
+          const m = dist[i][j];
+          matrixRoad[i][j] = (typeof m === 'number') ? Math.round(m/1000) : null;
+        }
+      }
+      renderMatrix(); drawGraph(); setStatus('MatrizRoad completada desde OSRM table.');
+      return;
+    } else {
+      throw new Error('OSRM table no devolvió distances');
+    }
+  }catch(e){
+    console.warn('OSRM table failed, fallback to pairs', e);
+    setStatus('Table falló — usando fallback por pares (más lento)');
+    await fillPairsFallback(locs);
+  }
+});
+
+/* fallback: route request per pair */
+async function fillPairsFallback(locs){
+  const n = locs.length;
+  const delay = Number(document.getElementById('delayMs').value) || 800;
+  setStatus(`Fallback por pares: ${(n*(n-1)/2)} peticiones (esto tardará)...`);
+  for(let i=0;i<n;i++){
+    for(let j=i+1;j<n;j++){
+      if(matrixRoad[i][j] !== null && matrixRoad[i][j] !== undefined && matrixRoad[i][j] !== '') continue;
+      const a = locs[i], b = locs[j];
+      const url = `https://router.project-osrm.org/route/v1/driving/${a[1]},${a[0]};${b[1]},${b[0]}?overview=false`;
+      try{
+        const res = await fetch(url);
+        if(!res.ok){ matrixRoad[i][j] = matrixRoad[j][i] = null; console.warn('pair failed', res.status); }
+        else {
+          const json = await res.json();
+          const meters = json && json.routes && json.routes[0] && json.routes[0].distance;
+          if(typeof meters === 'number') matrixRoad[i][j] = matrixRoad[j][i] = Math.round(meters/1000);
+          else matrixRoad[i][j] = matrixRoad[j][i] = null;
+        }
+      }catch(err){
+        console.error('pair err', err); matrixRoad[i][j] = matrixRoad[j][i] = null;
+      }
+      updateCellInTable(i,j,matrixRoad[i][j]);
+      renderMatrix(); drawGraph();
+      await sleep(delay);
+    }
+  }
+  setStatus('Fallback terminado — matrizRoad (parcial) completada.');
+}
+
+/* helper update cell */
+function updateCellInTable(i,j,val){
+  const wrap = document.getElementById('matrixWrap'); const table = wrap.querySelector('table');
+  if(!table) return;
+  const row = table.rows[i+1]; const cell = row.cells[j+1];
+  const top = cell.querySelector('.cell-road'); const bottom = cell.querySelector('.cell-straight');
+  if(top) top.textContent = (val===null||val===undefined||val==='')? '': `${val} km`;
+  if(bottom && matrixStraight[i][j]!=null) bottom.textContent = `(${matrixStraight[i][j]} km)`;
+}
+
+/* ============================
+   Threshold apply
+   ============================ */
+document.getElementById('applyThreshBtn').addEventListener('click', ()=>{
+  const t = Number(document.getElementById('edgeThresh').value) || null;
+  currentEdgeThreshold = t;
+  drawGraph();
+});
+
+/* ============================
+   Export CSV
+   ============================ */
+document.getElementById('exportCsvBtn').addEventListener('click', ()=>{
+  if(!towns.length) return alert('Genera la matriz primero');
+  let csv = ',Road_km, Straight_km\n';
+  for(let i=0;i<towns.length;i++){
+    for(let j=0;j<towns.length;j++){
+      if(j===0) csv += escapeCsv(towns[i]);
+      csv += ',' + (matrixRoad[i][j]===null||matrixRoad[i][j]===undefined||matrixRoad[i][j]===''? '' : String(matrixRoad[i][j])) + ',' + (matrixStraight[i][j]===null||matrixStraight[i][j]===undefined||matrixStraight[i][j]===''? '' : String(matrixStraight[i][j]));
+    }
+    csv += '\n';
+  }
+  const blob = new Blob([csv],{type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'matriz_road_and_straight.csv'; a.click(); URL.revokeObjectURL(url);
+});
+
+/* ============================
+   Route eval & fuel
+   ============================ */
+document.getElementById('calcRouteBtn').addEventListener('click', ()=>{
+  const raw = document.getElementById('routeInput').value.trim();
+  if(!raw) return alert('Escribe la ruta separada por comas');
+  const routeNames = raw.split(',').map(s=>s.trim()).filter(Boolean);
+  const idx = routeNames.map(r=>towns.indexOf(r));
+  if(idx.some(i=>i===-1)) return alert('Algún nombre no coincide con la lista de pueblos.');
+  let total=0; let missing=false; const legs=[];
+  for(let k=0;k<idx.length-1;k++){
+    const a=idx[k], b=idx[k+1];
+    const d = matrixRoad[a][b];
+    if(d===null||d===undefined||d==='') { missing=true; legs.push({from:towns[a],to:towns[b],dist:null}); }
+    else { total += Number(d); legs.push({from:towns[a],to:towns[b],dist:Number(d)}); }
+  }
+  const fuel = total * 0.102;
+  let out = '<strong>Ruta evaluada:</strong> ' + routeNames.join(' → ') + '<br/>';
+  out += '<strong>Tramos:</strong><ul>' + legs.map(l=>'<li>'+l.from+' → '+l.to+': '+(l.dist===null?'<em>faltan datos</em>':l.dist+' km')+'</li>').join('') + '</ul>';
+  out += '<strong>Distancia total:</strong> ' + (missing?'<em>incompleta</em> '+total+' km (parcial)':'<span>'+total+' km</span>') + '<br/>';
+  out += '<strong>Combustible (f(x)=0.102x):</strong> ' + (missing?'<em>parcial</em> '+fuel.toFixed(3)+' L':fuel.toFixed(3)+' L') + '<br/>';
+  document.getElementById('results').innerHTML = out;
+  highlightRoute(idx);
+});
+
+/* highlight route (red lines) */
+function highlightRoute(idx){
+  if(highlightedLayer){ map.removeLayer(highlightedLayer); highlightedLayer = null; }
+  highlightedLayer = L.layerGroup().addTo(map);
+  for(let k=0;k<idx.length-1;k++){
+    const a = COORDS[towns[idx[k]]], b = COORDS[towns[idx[k+1]]];
+    if(!a||!b) continue;
+    L.polyline([a,b], {color:'#ef4444', weight:4}).addTo(highlightedLayer);
+  }
+  drawGraph();
+}
+
+/* ============================
+   Dijkstra shortest path (using matrixRoad weights)
+   ============================ */
+document.getElementById('dijkstraBtn').addEventListener('click', ()=>{
+  const start = prompt('Nombre del nodo origen (exacto):');
+  if(!start) return;
+  const end = prompt('Nombre del nodo destino (exacto):');
+  if(!end) return;
+  const sIdx = towns.indexOf(start), tIdx = towns.indexOf(end);
+  if(sIdx===-1 || tIdx===-1) return alert('Origen o destino no encontrado en la lista.');
+  const {dist, prev} = dijkstra(matrixRoad, sIdx);
+  if(dist[tIdx]===Infinity) { alert('No hay camino (filas faltantes)'); return; }
+  // build path
+  const path = [];
+  let u = tIdx;
+  while(u !== null && u !== undefined){ path.push(u); u = prev[u]; }
+  path.reverse();
+  const pathNames = path.map(i=>towns[i]);
+  alert('Ruta óptima: ' + pathNames.join(' → ') + '\nDistancia total: ' + dist[tIdx] + ' km');
+  highlightRoute(path);
+});
+
+/* Dijkstra implementation */
+function dijkstra(weightMatrix, src){
+  const n = weightMatrix.length;
+  const dist = Array(n).fill(Infinity);
+  const prev = Array(n).fill(null);
+  const used = Array(n).fill(false);
+  dist[src]=0;
+  for(let k=0;k<n;k++){
+    let u = -1;
+    for(let i=0;i<n;i++) if(!used[i] && (u===-1 || dist[i] < dist[u])) u = i;
+    if(u===-1 || dist[u]===Infinity) break;
+    used[u]=true;
+    for(let v=0; v<n; v++){
+      const w = weightMatrix[u][v];
+      if(w===null||w===undefined) continue;
+      if(dist[v] > dist[u] + w){
+        dist[v] = dist[u] + w;
+        prev[v] = u;
+      }
+    }
+  }
+  // round distances to integer km
+  for(let i=0;i<n;i++) if(dist[i] !== Infinity) dist[i] = Math.round(dist[i]);
+  return {dist, prev};
+}
+
+/* ============================
+   Init (auto-generate initial view)
+   ============================ */
+(function init(){
+  towns = DEFAULT_TOWNS.slice();
+  const n = towns.length;
+  matrixRoad = Array.from({length:n}, ()=>Array.from({length:n}, ()=>null));
+  matrixStraight = Array.from({length:n}, ()=>Array.from({length:n}, ()=>null));
+  for(let i=0;i<n;i++){ matrixRoad[i][i]=0; matrixStraight[i][i]=0; }
+  computeStraightMatrix();
+  renderMatrix();
+  renderMap();
+  drawGraph();
+  setStatus('Listo. Pulsa "Calcular distancias (OSRM)" para rellenar la matriz de carretera.');
+})();
+
+/* fit map button */
+document.getElementById('fitMapBtn').addEventListener('click', fitMap);
+
+</script>
+</body>
+</html>
